@@ -12,26 +12,59 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from . import protocol_v2 as p2
 from .client import AmtClient, AmtError, discover, discover_network, e9_request
+from .client_v2 import AmtV2Client, open_panel
 from .config import ConfigError, load_settings
 from .decode import OpenZonesError, Status
+from .decode_v2 import StatusV2
 from .protocol import E9_READ_ONLY, MENU_SIREN_STATUS, UNIVERSAL_READS, Cmd, FrameError
+from .protocol_v2 import V2CommandError
 
 EXIT_OK, EXIT_ERROR, EXIT_NEEDS_CONFIRMATION = 0, 1, 2
+NOT_READ = "not read (--quick)"
 
 # Commands that change the panel: each one needs --yes.
 WRITE_COMMANDS = {
     "arm", "disarm", "silence", "pgm", "bypass", "clear-triggered",
-    "set-clock", "eeprom-write", "bus-search",
+    "set-clock", "eeprom-write", "bus-search", "panic",
 }
+
+# Which protocol family each command belongs to. A command is never sent to a
+# panel of the other family: with --protocol it is refused before connecting,
+# with "auto" right after the refresh that identifies the family.
+V1_ONLY = {
+    "problems", "mac", "pgm-state", "eeprom", "bus-devices", "connections", "network",
+    "cell", "wireless", "clear-triggered", "set-clock", "eeprom-write", "bus-search", "raw", "e9",
+}
+V2_ONLY = {"info", "panic", "raw2"}
+
+
+def command_families(command: str) -> set[str]:
+    if command in V1_ONLY:
+        return {"v1"}
+    if command in V2_ONLY:
+        return {"v2"}
+    return {"v1", "v2"}
 
 
 def _partition(value: str) -> int:
-    mapping = {"a": 1, "b": 2, "c": 3, "d": 4, "1": 1, "2": 2, "3": 3, "4": 4}
+    letters = {"a": 1, "b": 2, "c": 3, "d": 4}
+    if value.lower() in letters:
+        return letters[value.lower()]
+    if value.isdigit() and 1 <= int(value) <= 16:
+        return int(value)
+    raise argparse.ArgumentTypeError("partition must be A-D or 1-16 (1-16 on ISECNet v2)")
+
+
+def _v2_command(value: str) -> int:
     try:
-        return mapping[value.lower()]
-    except KeyError:
-        raise argparse.ArgumentTypeError("partition must be A-D or 1-4") from None
+        code = int(value, 16)
+    except ValueError:
+        code = -1
+    if not 0 <= code <= 0xFFFF:
+        raise argparse.ArgumentTypeError("v2 command must be hex 0000-FFFF, e.g. 0b4a")
+    return code
 
 
 def _int(value: str) -> int:
@@ -84,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--password", help="remote-access password (prefer env AMT_PASSWORD)")
     parser.add_argument("--env-file", type=Path, help="settings file (default ./.env)")
     parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument(
+        "--protocol", choices=("auto", "v1", "v2"),
+        help="panel family (env AMT_PROTOCOL, default auto): v1 = AMT 1016/2018/Smart/4010, v2 = AMT 8000/ANM 24 NET",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def write(name: str, help_text: str) -> argparse.ArgumentParser:
@@ -112,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     # writes
     for name, help_text in (("arm", "arm the panel or one partition"), ("disarm", "disarm the panel or one partition")):
         cmd = write(name, help_text)
-        cmd.add_argument("--partition", type=_partition, help="A-D (default: whole panel)")
+        cmd.add_argument("--partition", type=_partition, help="A-D, or 1-16 on v2 (default: whole panel)")
         cmd.add_argument("--stay", action="store_true", help="stay mode (Smart models, 4010 Smart fw 5.7+)")
     write("silence", "silence a firing alarm (siren off)")
     pgm = write("pgm", "switch a PGM output: 1-3 on/off (checked), 4-19 toggle (4010 Smart)")
@@ -139,6 +176,15 @@ def build_parser() -> argparse.ArgumentParser:
     e9 = sub.add_parser("e9", help="send one E9 frame (the cloud apps' format); old firmware only ACKs it")
     e9.add_argument("data", type=_hex, help="command bytes, e.g. '5a' (partial status)")
     e9.add_argument("--yes", action="store_true", help="needed unless the command only reads")
+
+    # ISECNet v2 only (AMT 8000 family, ANM 24 NET)
+    sub.add_parser("info", help="v2: model and firmware (INFO)")
+    panic = write("panic", "v2: trigger a panic alarm (AMT 8000 family)")
+    panic.add_argument("kind", choices=tuple(p2.PANIC_TYPES))
+    raw2 = sub.add_parser("raw2", help="v2: send any v2 command (command hex, optional payload hex)")
+    raw2.add_argument("command_code", type=_v2_command, metavar="COMMAND", help="e.g. 0b4a")
+    raw2.add_argument("payload", type=_hex, nargs="?", default=b"", help="payload hex, e.g. 'ff 01'")
+    raw2.add_argument("--yes", action="store_true", help="needed unless the command only reads")
     return parser
 
 
@@ -149,9 +195,10 @@ def format_status(st: Status) -> str:
     def stay(value) -> str:
         return "" if value is None else (" (stay)" if value else "")
 
+    armed_text = "yes" if st.armed else "partial" if any(p.armed for p in st.partitions) else "no"
     lines = [
         f"Model:      {st.model} (firmware {st.firmware})",
-        f"Armed:      {'yes' if st.armed else 'no'}{stay(st.stay_armed)} (mask 0x{st.armed_mask:02X})",
+        f"Armed:      {armed_text}{stay(st.stay_armed)} (mask 0x{st.armed_mask:02X})",
     ]
     lines += [f"  {p.name}: {'armed' if p.armed else 'disarmed'}{stay(p.stay_armed)}" for p in st.partitions]
     if st.partitioned is not None:
@@ -161,7 +208,7 @@ def format_status(st: Status) -> str:
     lines += [
         f"Open zones: {zones(st.open_zones)}",
         f"Triggered:  {zones(st.triggered_zones)}",
-        f"Bypassed:   {zones(st.bypassed_zones)}",
+        f"Bypassed:   {NOT_READ if st.bypassed_zones is None else zones(st.bypassed_zones)}",
     ]
     if st.enabled_zones is not None:
         lines.append(f"Enabled:    {zones(st.enabled_zones)}")
@@ -174,7 +221,10 @@ def format_status(st: Status) -> str:
     ]
     if st.pgm:
         lines.append("PGM:        " + ", ".join(f"{k}={'on' if v else 'off'}" for k, v in st.pgm.items()))
-    lines.append("Problems:   " + ("; ".join(st.problems) if st.problems else "none"))
+    if st.problems is None:
+        lines.append(f"Problems:   {NOT_READ}")
+    else:
+        lines.append("Problems:   " + ("; ".join(st.problems) or "none"))
     return "\n".join(lines)
 
 
@@ -207,6 +257,10 @@ def _describe(args: argparse.Namespace) -> str:
         return f"write {args.data.hex(' ')} at EEPROM {args.address}"
     if args.command in ("raw", "e9"):
         return f"send {args.command.upper()} command {args.data.hex(' ')}"
+    if args.command == "raw2":
+        return f"send v2 command 0x{args.command_code:04X} {args.payload.hex(' ')}".rstrip()
+    if args.command == "panic":
+        return f"trigger a {args.kind} panic alarm"
     return {
         "silence": "silence the alarm",
         "clear-triggered": "clear the triggered-zone memory",
@@ -224,6 +278,8 @@ def _needs_confirmation(args: argparse.Namespace) -> bool:
         return not safe and not args.yes
     if args.command == "e9":
         return args.data[0] not in E9_READ_ONLY and not args.yes
+    if args.command == "raw2":
+        return args.command_code not in p2.READ_ONLY and not args.yes
     return False
 
 
@@ -242,21 +298,32 @@ def _run_discover(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def run(args: argparse.Namespace, client_factory=AmtClient) -> int:
+def run(args: argparse.Namespace) -> int:
     if _needs_confirmation(args):
         print(f"Would {_describe(args)}. Re-run with --yes to send it.", file=sys.stderr)
         return EXIT_NEEDS_CONFIRMATION
     if args.command == "discover":
         return _run_discover(args)
 
-    settings = load_settings(args.host, args.port, args.password, args.env_file)
+    settings = load_settings(args.host, args.port, args.password, args.env_file, protocol=args.protocol)
+    families = command_families(args.command)
+    if settings.protocol != "auto" and settings.protocol not in families:
+        raise ConfigError(
+            f"'{args.command}' is an ISECNet {'/'.join(sorted(families))} command, "
+            f"but the panel is set to {settings.protocol}; nothing sent"
+        )
     if args.command == "e9":
+        if settings.protocol != "v1":
+            raise ConfigError("e9 sends v1 cloud frames on its own connection; pass --protocol v1 to confirm the family")
         reply = e9_request(settings.host, settings.password, args.data, port=settings.port)
         payload = {"code": f"{reply.code:02X}", "error": reply.error, "body": reply.body.hex(" ")}
         _emit(args, payload, reply.error or ("ACK" if not reply.body else reply.body.hex(" ")))
         return EXIT_ERROR if reply.error else EXIT_OK
 
-    with client_factory(settings.host, settings.password, port=settings.port) as client:
+    client = open_panel(settings.host, settings.password, port=settings.port, protocol=settings.protocol, families=families)
+    with client:
+        if isinstance(client, AmtV2Client):
+            return _run_session_v2(args, client)
         return _run_session(args, client)
 
 
@@ -339,11 +406,90 @@ def _run_session(args: argparse.Namespace, client: AmtClient) -> int:
     return EXIT_OK
 
 
+def format_status_v2(st: StatusV2) -> str:
+    def zones(values) -> str:
+        return ", ".join(map(str, values)) or "none"
+
+    lines = [
+        f"Model:      {st.model} (firmware {st.firmware})",
+        f"State:      {st.state}",
+    ]
+    lines += [
+        f"  Partition {p.id}: {'stay' if p.stay else 'armed' if p.armed else 'disarmed'}{' FIRING' if p.firing else ''}"
+        for p in st.partitions
+    ]
+    lines += [
+        f"Partitioned: {'yes' if st.partitioned else 'no'}",
+        f"Alarm firing: {'YES' if st.firing else 'no'}",
+        f"Open zones: {zones(st.open_zones)}",
+        f"Triggered:  {zones(st.violated_zones)}",
+        f"Bypassed:   {zones(st.bypassed_zones)}",
+    ]
+    if st.tamper_zones or st.low_battery_zones or st.communication_error_zones:
+        lines += [
+            f"Tamper:     {zones(st.tamper_zones)}",
+            f"Low battery zones: {zones(st.low_battery_zones)}",
+            f"Comm. errors: {zones(st.communication_error_zones)}",
+        ]
+    lines.append(f"Clock:      {st.clock or 'unknown'} (raw {st.clock_raw})")
+    if st.battery:
+        lines.append(f"Battery:    {st.battery}")
+    if st.pgm:
+        on = [str(n) for n, v in st.pgm.items() if v]
+        lines.append(f"PGM on:     {', '.join(on) or 'none'}")
+    return "\n".join(lines)
+
+
+def _run_session_v2(args: argparse.Namespace, client: AmtV2Client) -> int:
+    c = args.command
+    if c == "info":
+        info = client.info()
+        _emit(args, info.to_dict(), _kv(info.to_dict()))
+    elif c == "status":
+        st = client.status()
+        _emit(args, st.to_dict(), format_status_v2(st))
+    elif c in ("arm", "disarm"):
+        st = client.set_armed(c == "arm", args.partition, stay=args.stay)
+        _emit(args, st.to_dict(), format_status_v2(st))
+    elif c == "silence":
+        client.silence_alarm()
+        _emit(args, {"silenced": True}, "siren off")
+    elif c == "panic":
+        client.panic(args.kind)
+        _emit(args, {"panic": args.kind}, f"{args.kind} panic triggered")
+    elif c == "pgm":
+        if args.action == "toggle":
+            raise ValueError("v2 PGMs are switched on/off explicitly: use 'on' or 'off'")
+        state = client.set_pgm(args.number, args.action == "on")
+        _emit(args, {str(k): v for k, v in state.items()}, f"PGM {args.number} {args.action}")
+    elif c == "bypass":
+        current = set(client.status().bypassed_zones)
+        if args.clear:
+            wanted = set()
+        elif args.set is not None:
+            wanted = set(args.set)
+        elif args.add is not None:
+            wanted = current | set(args.add)
+        else:
+            wanted = current - set(args.remove)
+        now = sorted(current)
+        if wanted - current:
+            now = client.set_bypass(wanted - current, True)
+        if current - wanted:
+            now = client.set_bypass(current - wanted, False)
+        _emit(args, {"bypassed_zones": now}, "bypassed: " + (", ".join(map(str, now)) or "none"))
+    elif c == "raw2":
+        frame = client.raw(args.command_code, args.payload)
+        payload = {"command": f"{frame.command:04X}", "payload": frame.payload.hex(" ")}
+        _emit(args, payload, f"{frame.command:04X} {frame.payload.hex(' ')}".rstrip())
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return run(args)
-    except (ConfigError, AmtError, FrameError, OpenZonesError, ValueError) as exc:
+    except (ConfigError, AmtError, FrameError, OpenZonesError, V2CommandError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 

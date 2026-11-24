@@ -77,6 +77,15 @@ def test_stay_arm_on_smart_is_state_checked(make_panel):
     assert sent(panel, 0x16) == [bytes([0x16, 0x20])]
 
 
+def test_whole_panel_stay_refused_when_partially_stay_armed(make_panel):
+    state, panel = make_panel(model=0x34)
+    state.stay_mask = 0x01
+    with client_for(panel) as c:
+        with pytest.raises(CommandError, match="individually"):
+            c.set_armed(True, stay=True)
+    assert sent(panel, 0x16) == []
+
+
 def test_stay_refused_where_state_cannot_be_read(fake_panel):
     with client_for(fake_panel) as c:
         with pytest.raises(CommandError, match="stay"):
@@ -204,11 +213,22 @@ def test_4010_bus_search(make_panel):
         assert c.search_bus() is True
 
 
-def test_unsupported_command_reports_model(make_panel):
-    _, panel = make_panel()  # AMT 1016 NET does not answer 0x30
+def test_unsupported_command_refused_before_sending(make_panel):
+    _, panel = make_panel()  # AMT 1016 NET: 0x30 hung a real one
     with client_for(panel, timeout=0.3) as c:
-        with pytest.raises(CommandError, match="not supported"):
-            c.connections()
+        for call in (c.connections, c.network_card, c.cell_card, c.wireless_sensors, c.bus_devices, c.search_bus):
+            with pytest.raises(CommandError, match="not supported by AMT 1016 NET; not sent"):
+                call()
+    sent_cmds = {r[0] for r in panel.requests}
+    assert not sent_cmds & {0x22, 0x23, 0x30, 0x31, 0x32, 0x36}
+
+
+def test_bus_search_refused_on_smart(make_panel):
+    _, panel = make_panel(model=0x34)
+    with client_for(panel) as c:
+        with pytest.raises(CommandError, match="not sent"):
+            c.search_bus()
+    assert sent(panel, 0x22) == []
 
 
 # -- raw --------------------------------------------------------------------------------

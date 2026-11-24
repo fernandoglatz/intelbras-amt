@@ -1,12 +1,16 @@
 # intelbras-amt
 
-Local, cloud-free control of **Intelbras AMT 2018-family alarm panels**
-(AMT 1016 NET, AMT 2018 E/EG, AMT 2118 EG, AMT 2016/2018 E3G) from Python or
-the command line.
+Local, cloud-free control of **Intelbras alarm panels** from Python or the
+command line, over both Intelbras protocol families:
 
-It talks straight to the panel over your LAN (TCP 9009), using the same `0xE7`
-protocol as Intelbras' **AMT Remoto Mobile** app. No Intelbras account, no
-cloud relay and no extra hardware. Pure Python 3.10+, no runtime dependencies.
+* **ISECNet v1**: AMT 1016 NET, AMT 2018 E/EG, AMT 2118 EG, AMT 2016/2018 E3G,
+  AMT 2018 E Smart, AMT 1000 Smart, AMT 4010 Smart
+* **ISECNet v2**: AMT 8000 / 8000 PRO / 8000 LITE, ANM 24 NET (+ G2)
+
+It talks straight to the panel over your LAN (TCP 9009), the way Intelbras'
+**AMT Remoto Mobile** app does locally, and detects the family by itself. No
+Intelbras account, no cloud relay and no extra hardware. Pure Python 3.10+, no
+runtime dependencies.
 
 ```console
 $ intelbras-amt status
@@ -66,7 +70,7 @@ Every Intelbras model found in the three official apps' code, with what this
 client does with it today. The **code** is the model byte the panel reports
 (status reply byte 1 on this protocol; Guardian uses the same values).
 
-### ISECNet v1 panels (the family this client speaks)
+### ISECNet v1 panels
 
 | Model | Code | Zones / partitions / PGMs | Status layout | Discovery name | Min. firmware for Guardian (main / Ethernet) | This client |
 |-------|------|---------------------------|---------------|----------------|----------------------------------------------|-------------|
@@ -78,26 +82,35 @@ client does with it today. The **code** is the model byte the panel reports
 | AMT 2018 E Smart | `0x34` (52) | 48 / 2 / 2 | `0x27`, Smart layout (adds stay, wireless sensors) | `AMT2018E SMART` | 1.8 / any | Supported, untested |
 | AMT 1000 Smart | `0x36` (54) | 48 / none / 2 | `0x27`, Smart layout | `AMT 1000 SMART` | 1.8 / any | Supported, untested |
 | AMT 4010 Smart | `0x41` (65) | 64 / 4 / 19 | `0x17`, 4010 layout (8 zone pairs, stay per partition from fw 5.7 per AMT Remoto, 5.0 per Guardian) | `XEG 4000 Smart` | 3.2 / 2.0 | Supported, untested |
-| ANM 24 NET | `0x24` (36)¹ | 24 / none / 1 | own layout (`Read24NetStatus`) | `ANM24NET` | 3.0 / any | Not supported |
-| ANM 24 NET G2 | `0x25` (37) | 24 / none / 1 | own layout | `ANM24NETG2` | any | Not supported |
 
 "Supported, untested" means the client decodes the layout exactly as the
 official app does, but nobody has confirmed it on that hardware yet. The Smart
 and 4010 layouts are decoded from the app's code alone.
 
-¹ AMT Remoto Mobile lists ANM 24 NET as code 2; Guardian and AMT Mobile V3 use 36.
+### ISECNet v2 panels
 
-### Other families (not supported: different protocol)
+Protocol details in [docs/PROTOCOL-V2.md](docs/PROTOCOL-V2.md). **No v2 panel
+has been tested yet**: everything below follows the official apps' code.
 
-| Model | Code | Zones / partitions / PGMs | Protocol |
-|-------|------|---------------------------|----------|
-| AMT 8000 | `0x01` (1) | 64 / 16 / 16 | ISECNet v2 (found by UDP multicast) |
-| AMT 8000 PRO | `0x8A` (138) | 64 / 16 / 16 | ISECNet v2 |
-| AMT 8000 LITE | `0x8B` (139) | 64 / 16 / 16 | ISECNet v2 |
-| AMT 9000 | `0x90` (144) | 244 / 8 / 26 | ISECNet v2 |
-| ELC 6012 NET (electric fence) | `0x35` (53) | 8 / 2 / 2 | ISECNet v2 |
-| ELC 6012 IND (electric fence) | `0x39` (57) | 8 / 2 / 2 | ISECNet v2 |
-| 4G communicator (Wi-Fi) | `0x38` (56) | – | own layout (AMT Remoto only) |
+| Model | Code | Zones / partitions / PGMs | Status | This client |
+|-------|------|---------------------------|--------|-------------|
+| AMT 8000 | `0x01` (1) | 64 / 16 / 16 | full `0B4A` | Supported, untested: status, arm/disarm/stay, bypass, PGM, siren off, panic |
+| AMT 8000 PRO | `0x8A` (138) | 64 / 16 / 16 | full `0B4A` | Same as AMT 8000, untested |
+| AMT 8000 LITE | `0x8B` (139) | 64 / 16 / 16 | full `0B4A` | Same as AMT 8000, untested |
+| ANM 24 NET | `0x02` / `0x24`¹ | 24 / none / 1 | basic `0B01` | Supported, untested: status, arm/disarm/partial (whole panel). Bypass, PGM, siren, panic refused |
+| ANM 24 NET G2 | `0x25` (37) | 24 / none / 1 | basic `0B01` | Same as ANM 24 NET, untested |
+| AMT 9000 | `0x90` (144) | 244 / 8 / 26 | paged `0B4B` | Detected; status refused (layout not decoded) |
+| ELC 6012 NET / IND (electric fence) | `0x35` / `0x39` | 8 / 2 / 2 | – | Detected; status refused |
+
+¹ AMT Remoto uses code 2 for the ANM 24 NET; Guardian and AMT Mobile V3 use 36.
+Guardian lists the ANM among v1 panels for its cloud path, but AMT Remoto talks
+to it locally with v2 frames, and this client detects whichever it answers.
+
+### Other
+
+| Model | Code | Notes |
+|-------|------|-------|
+| 4G communicator (Wi-Fi) | `0x38` (56) | Not a panel; not supported |
 
 ### Legacy models (named only in AMT Mobile V3)
 
@@ -106,9 +119,10 @@ apps: GPRS 1000 UN (`0x04`), AMT 2008 RF (`0x08`), AMT 2010 (`0x10`), AMT 2018
 (`0x18`, the original, pre-E/EG), AMT 2110 (`0x20`), AMT 3010 (`0x30`).
 Nothing is known about their protocol beyond the code.
 
-According to the official app, the session (login, problems, EEPROM reads,
+According to the official apps, the session (login, problems, EEPROM reads,
 arm/disarm, hang-up) is common to the whole v1 family and only the status
-layout differs. If you own one of the untested or undecoded models, see
+layout differs; within v2, the AMT 8000 family and the ANM 24 NET differ in
+which status command they use. If you own one of the untested or undecoded models, see
 [Contributing](#contributing): a single captured status frame is enough to add
 it.
 
@@ -182,7 +196,13 @@ cp .env.example .env
 AMT_HOST=192.168.1.50   # panel IP
 AMT_PORT=9009           # optional, default 9009
 AMT_PASSWORD=           # remote-access password, 4 or 6 digits
+AMT_PROTOCOL=auto       # optional: auto (default), v1 or v2
 ```
+
+With `auto`, the client sends only the refresh frame AMT Remoto itself sends
+first to every panel, and reads the family from the answer (`90` = v1, `80` =
+v2). Setting `v1` or `v2` additionally refuses the other family's commands
+before connecting.
 
 `.env` is in `.gitignore`. Prefer it (or the environment) over `--password`,
 which leaves the password in your shell history.
@@ -198,33 +218,46 @@ which leaves the password in your shell history.
 > does not know them. The "Models" column below is taken from the official
 > apps' code; nothing outside "Tested live" has been run on real hardware.
 
-| Command | What it does | Models | Writes | Tested live |
-|---------|--------------|--------|--------|-------------|
-| `status [--quick]` | Armed state, zones, voltages, clock, siren, PGMs, problems | all v1 | – | yes (1016 NET) |
-| `problems` | Active problems | all v1 | – | yes |
-| `mac` | MAC address (EEPROM read) | all v1 | – | yes |
-| `pgm-state` | Siren and PGM 1–3 state | all v1 | – | yes |
-| `eeprom ADDR COUNT` | Raw EEPROM read | all v1 | – | yes |
-| `discover [IP or CIDR]` | MAC and model, no password | all v1 | – | yes |
-| `arm` / `disarm [--partition A-D] [--stay]` | Arm/disarm, state-checked | all v1; `--stay` only Smart models and 4010 Smart fw 5.7+ | yes | no |
-| `silence` | Silence a firing alarm | all v1 | yes | no |
-| `pgm N on\|off\|toggle` | PGM 1–3 on/off (state-checked); 4–19 toggle | 1–3 all v1; 4–19 only 4010 Smart | yes | no |
-| `bypass --add/--remove/--set ZONES \| --clear` | Bypass zones, verified by reading back | all v1 | yes | no |
-| `clear-triggered` | Clear the triggered-zone memory | all v1 | yes | no |
-| `set-clock [--time 'YYYY-MM-DD HH:MM']` | Set the panel clock | all v1 | yes | no |
-| `eeprom-write ADDR HEX` | Write configuration memory (protected areas refused, verified) | all v1 | yes | no |
-| `connections` | Ethernet/cellular links to monitoring and cloud | **Smart only** | – | **hung a 1016 NET** |
-| `network` | IP, mask, gateway, DNS, MAC | **Smart only** | – | no |
-| `cell` | Cellular module, signal, SIM, carrier, ICCID, IMEI | **Smart only** | – | no |
-| `wireless` | Per-sensor battery, tamper, supervision, signal | **Smart only**, fw 1.80+ | – | no |
-| `bus-devices` | Keypads and receivers on the bus | **4010 Smart, Smart** | – | no |
-| `bus-search` | Make the panel scan its bus | **4010 Smart only** | yes | no |
-| `raw HEX` | Any E7 command | depends on the command | `--yes` unless it is a read every model supports (`10 12 14 15 17 1D`, `19 10`) | `17` only |
-| `e9 HEX` | One E9 frame (the cloud apps' format) | panels with newer firmware | if not a read | `5A` (ACK only) |
+| Command | What it does | Family | Models | Writes | Tested live |
+|---------|--------------|--------|--------|--------|-------------|
+| `status [--quick]` | Armed state, zones, voltages/battery, clock, siren, PGMs, problems (`--quick`: one status read; bypass and problems shown as not read) | v1, v2 | all v1; v2: AMT 8000 family, ANM 24 NET | – | yes (1016 NET) |
+| `problems` | Active problems | v1 | all v1 | – | yes |
+| `mac` | MAC address (EEPROM read) | v1 | all v1 | – | yes |
+| `pgm-state` | Siren and PGM 1–3 state | v1 | all v1 | – | yes |
+| `eeprom ADDR COUNT` | Raw EEPROM read | v1 | all v1 | – | yes |
+| `discover [IP or CIDR]` | MAC and model, no password | – | all v1 | – | yes |
+| `arm` / `disarm [--partition A-D\|1-16] [--stay]` | Arm/disarm, state-checked; whole panel from a partial state goes partition by partition | v1, v2 | all v1 (`--stay`: Smart models, 4010 Smart fw 5.7+); v2: AMT 8000 family (partitions 1–16), ANM 24 NET (whole panel) | yes | yes (1016 NET: whole panel, A, B, from partial) |
+| `silence` | Silence a firing alarm | v1, v2 | all v1; v2: AMT 8000 family | yes | no |
+| `pgm N on\|off\|toggle` | Switch a PGM output, state-checked where the panel reports it | v1, v2 | v1: PGM 1–3 all, 4–19 (toggle only) 4010 Smart; v2: PGM 1–16 on/off, AMT 8000 family | yes | no |
+| `bypass --add/--remove/--set ZONES \| --clear` | Bypass zones, verified by reading back | v1, v2 | all v1; v2: AMT 8000 family | yes | yes (1016 NET, add/remove) |
+| `clear-triggered` | Clear the triggered-zone memory | v1 | all v1 | yes | yes |
+| `set-clock [--time 'YYYY-MM-DD HH:MM']` | Set the panel clock | v1 | all v1 | yes | yes |
+| `eeprom-write ADDR HEX` | Write configuration memory (protected areas refused, verified) | v1 | all v1 | yes | no |
+| `connections` | Ethernet/cellular links to monitoring and cloud | v1 | **Smart only** | – | **hung a 1016 NET** |
+| `network` | IP, mask, gateway, DNS, MAC | v1 | **Smart only** | – | no |
+| `cell` | Cellular module, signal, SIM, carrier, ICCID, IMEI | v1 | **Smart only** | – | no |
+| `wireless` | Per-sensor battery, tamper, supervision, signal | v1 | **Smart only**, fw 1.80+ | – | no |
+| `bus-devices` | Keypads and receivers on the bus | v1 | **4010 Smart, Smart** | – | no |
+| `bus-search` | Make the panel scan its bus | v1 | **4010 Smart only** | yes | no |
+| `raw HEX` | Any E7 command | v1 | depends on the command | `--yes` unless it is a read every model supports (`10 12 14 15 17 1D`, `19 10`) | `17` only |
+| `e9 HEX` | One E9 frame (the cloud apps' format) | v1 (needs `--protocol v1`) | panels with newer firmware | if not a read | `5A` (ACK only) |
+| `info` | Model and firmware | v2 | all v2 | – | refusal on a v1 panel only |
+| `panic silent\|audible\|fire\|medical` | Trigger a panic | v2 | AMT 8000 family | yes | no |
+| `raw2 COMMAND [PAYLOAD]` | Any v2 command | v2 | depends on the command | `--yes` unless a read | no |
 
 "All v1" means the AMT 1016 NET, 2018 E/EG, 2118 EG, 2016/2018 E3G, 2018 E
-Smart, 1000 Smart and 4010 Smart. The client does **not** yet refuse a
-model-specific command on the wrong model, so check the table first.
+Smart, 1000 Smart and 4010 Smart; "all v2" the AMT 8000 family and the ANM 24
+NET. On v2, `status` shows a different set of fields (per-zone tamper, low
+battery, communication errors, 16 partitions and 16 PGMs); `--partition` takes
+1–16 and `pgm` takes `on`/`off` only.
+
+**The client refuses before sending:**
+- a command of the other protocol family (with `--protocol`, before
+  connecting; with `auto`, right after the refresh);
+- v1 Smart-only and 4010-only commands on other v1 models;
+- on the ANM 24 NET, partitions, bypass, PGM, siren and panic.
+
+`raw`, `raw2` and `e9` are not checked against the model.
 
 Examples:
 
@@ -239,7 +272,7 @@ intelbras-amt set-clock --yes
 ```
 
 Global options (before the command): `--host`, `--port`, `--password`,
-`--env-file`, `--format text|json`.
+`--env-file`, `--format text|json`, `--protocol auto|v1|v2`.
 
 Exit codes:
 
@@ -260,8 +293,13 @@ monitoring check.
 ## Python API
 
 ```python
-from intelbras_amt import AmtClient, AuthError, OpenZonesError
+from intelbras_amt import AmtClient, AmtV2Client, OpenZonesError, open_panel
 
+# Detect the family and get the right client (AmtClient or AmtV2Client).
+with open_panel("192.168.1.50", "123456") as panel:
+    print(type(panel).__name__, panel.status())
+
+# Or use a family's client directly; it refuses a panel of the other family.
 with AmtClient("192.168.1.50", "123456") as panel:
     st = panel.status()
     print(st.model, st.firmware)
@@ -284,19 +322,29 @@ with AmtClient("192.168.1.50", "123456") as panel:
 | `problems()` | list of problem descriptions |
 | `mac()` | `"AA:BB:CC:DD:EE:FF"` |
 | `read_eeprom(address, count)` | `bytes` |
-| `set_armed(armed, partition=None)` | `Status` after the change |
+| `set_armed(armed, partition=None, stay=False)` | `Status` after the change |
 | `silence_alarm()` | `None` |
+| `set_pgm(n, on)`, `toggle_pgm(n)`, `set_bypassed(zones)`, `clear_triggered()`, `set_clock(dt)`, `write_eeprom(addr, data)` | see the CLI table |
+
+`AmtV2Client` (ISECNet v2): `info()`, `status()` → `StatusV2`,
+`set_armed(armed, partition=None, stay=False)`, `set_bypass(zones, bypass)`,
+`set_pgm(n, on)`, `silence_alarm()`, `panic(kind)`, `raw(command, payload)`.
 
 Exceptions: `AuthError` (wrong password), `PanelTimeout`, `CommandError`
-(state did not change, invalid partition), `OpenZonesError`, `AmtError` (base
-class: connection, wrong panel family).
+(state did not change, invalid partition, command not supported by the model,
+nothing sent), `WrongFamilyError` (panel speaks the other family), `OpenZonesError`
+(v1), `V2CommandError` (v2 NACK with its reason, e.g. "open zones"), `AmtError`
+(base class).
 
 Always use the context manager (or call `close()`). It sends `HANG_UP`;
 without it the panel keeps the session busy for about 30 seconds.
 
 ## Safety
 
-- **Arm/disarm is a toggle on the panel.** The official app sends the same
+- **Never mix the families.** A v1 command sent to a v2 panel (or the other
+  way round) is exactly the kind of unknown command that hung an AMT 1016 NET.
+  The client only sends the shared refresh until it knows the family.
+- **On v1, arm/disarm is a toggle on the panel.** The official app sends the same
   packet both ways, so the client reads the status first, sends only when the
   state would change, and re-reads it afterwards to confirm. A whole-panel
   toggle is refused while only one partition is armed.
@@ -307,6 +355,8 @@ without it the panel keeps the session busy for about 30 seconds.
   TCP 9009 and ping (see [Command line](#command-line)). Check the "Models"
   column before running a model-specific command, `raw` or `e9`, and stop at
   the first command that gets no answer instead of retrying.
+- On v2, arm/disarm, PGM and bypass are explicit commands; the client still
+  reads the status before and after, and reports the panel's NACK reason.
 - `eeprom-write` changes the panel's programming. It refuses the address
   ranges the official app refuses and checks the result by reading it back,
   but a wrong value can still change how your alarm behaves. Note the previous
@@ -341,7 +391,8 @@ All frames on port 9009 look like:
 A session is: refresh (`10`) → identify with the password (`11 …`) →
 commands → hang up (`15`). The full protocol (frame format, CRC table, every
 command, the status byte map, EEPROM addresses, the problem bitmap and the
-unauthenticated discovery probes) is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+unauthenticated discovery probes) is in [docs/PROTOCOL.md](docs/PROTOCOL.md);
+the v2 family (AMT 8000, ANM 24 NET) in [docs/PROTOCOL-V2.md](docs/PROTOCOL-V2.md).
 How Intelbras' own apps use the cloud relay and REST API, plus the security
 observations, is in [docs/CLOUD.md](docs/CLOUD.md).
 
@@ -359,13 +410,16 @@ python3 -m pytest
 
 ```
 src/intelbras_amt/
-  protocol.py   framing, CRC table, command codes
-  decode.py     reply decoders (status, problems, siren, EEPROM, ...)
-  client.py     TCP session, reads, state-checked writes
+  protocol.py     v1 framing, CRC table, command codes, discovery and E9 frames
+  decode.py       v1 reply decoders (status layouts, problems, siren, EEPROM, ...)
+  client.py       v1 session, family probe, reads, state-checked writes
+  protocol_v2.py  v2 framing, commands, payloads, NACK reasons
+  decode_v2.py    v2 INFO, full status (AMT 8000), basic status (ANM 24 NET)
+  client_v2.py    v2 session and open_panel() (family detection)
   config.py     flags > environment > .env
   cli.py        command line
 tests/          live-captured frames + a threaded fake panel
-docs/           PROTOCOL.md, CLOUD.md
+docs/           PROTOCOL.md, PROTOCOL-V2.md, CLOUD.md
 ```
 
 The test fixtures are real frames captured from an AMT 1016 NET, with the

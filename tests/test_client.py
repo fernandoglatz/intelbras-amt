@@ -48,7 +48,7 @@ def test_invalid_password_fails_before_connecting():
 def test_non_2018_panel_is_rejected():
     panel = FakePanel(lambda data: bytes.fromhex("00 00 00 00 00 03 f0 f0 01 00"))
     try:
-        with pytest.raises(AmtError, match="not an AMT 2018-family panel"):
+        with pytest.raises(AmtError, match="not an AMT 2018-family or AMT 8000 panel"):
             client_for(panel).open()
     finally:
         panel.close()
@@ -116,15 +116,33 @@ def test_disarm_partition_b():
         panel.close()
 
 
-def test_whole_panel_toggle_refused_when_partially_armed():
-    panel = FakePanel(PanelState(armed_mask=0x01))
+@pytest.mark.parametrize(
+    "start, armed, expected_packets",
+    [
+        (0x01, False, [bytes([0x16, 0x01])]),  # A armed: disarm only A
+        (0x02, False, [bytes([0x16, 0x02])]),  # B armed: disarm only B
+        (0x01, True, [bytes([0x16, 0x02])]),  # A armed: arm only B
+    ],
+)
+def test_whole_panel_from_partial_state_goes_partition_by_partition(start, armed, expected_packets):
+    # Regression: a live 1016 NET with only A armed refused "disarm" for the whole panel.
+    # The whole-panel toggle is ambiguous there, so each partition that differs is toggled.
+    panel = FakePanel(PanelState(armed_mask=start))
     try:
         with client_for(panel) as client:
-            with pytest.raises(CommandError, match="individually"):
-                client.set_armed(False)
-        assert arm_requests(panel) == []
+            st = client.set_armed(armed)
+        assert st.armed_mask & 0x03 == (0x03 if armed else 0x00)
+        assert arm_requests(panel) == expected_packets
     finally:
         panel.close()
+
+
+def test_whole_panel_from_partial_state_unverified_raises(panel_state, fake_panel):
+    panel_state.armed_mask = 0x01
+    panel_state.ignore_arm = True
+    with client_for(fake_panel) as client:
+        with pytest.raises(CommandError, match="did not change"):
+            client.set_armed(False)
 
 
 def test_arm_refused_with_open_zones(fake_panel, panel_state):

@@ -247,3 +247,175 @@ def fake_panel(panel_state):
     panel = FakePanel(panel_state)
     yield panel
     panel.close()
+
+
+# -- ISECNet v2 (AMT 8000) fake ---------------------------------------------------------
+
+class FakeV2Panel:
+    """AMT 8000 on 127.0.0.1: answers the v1 refresh with 0x80, then v2 frames.
+
+    ``state`` is a V2State; requests are recorded as ("refresh", b"") or
+    (command, payload). Accepts several connections one after another.
+    """
+
+    def __init__(self, state: "V2State"):
+        self.state = state
+        self.requests: list[tuple] = []
+        self.server = socket.socket()
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(4)
+        self.port = self.server.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        from intelbras_amt import protocol_v2 as p2
+
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            with conn:
+                buf = b""
+                refreshed = False
+                while True:
+                    try:
+                        chunk = conn.recv(512)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while buf:
+                        if not refreshed:
+                            if len(buf) < buf[0] + 2:
+                                break
+                            raw, buf = buf[: buf[0] + 2], buf[buf[0] + 2 :]
+                            parse_frame(raw)  # must be a valid E7 refresh
+                            self.requests.append(("refresh", b""))
+                            refreshed = True
+                            conn.sendall(build_frame(bytes([0x80])))
+                            continue
+                        total = p2.frame_length(buf)
+                        if total is None or len(buf) < total:
+                            break
+                        raw, buf = buf[:total], buf[total:]
+                        frame = p2.parse_frame(raw)
+                        self.requests.append((frame.command, frame.payload))
+                        reply = self.state.handle(frame.command, frame.payload)
+                        if reply is not None:
+                            conn.sendall(reply)
+
+    def close(self) -> None:
+        self.server.close()
+
+
+class V2State:
+    """Explicit (non-toggle) v2 semantics, per Guardian's ISECNetV2Protocol."""
+
+    def __init__(self, password: str = "123456", model: int = 0x01):
+        self.password = password
+        self.model = model
+        self.partitions = {1: [False, False], 2: [False, False]}  # id -> [armed, stay]
+        self.bypassed: set[int] = set()
+        self.pgm: set[int] = set()
+        self.open_zones = False
+        self.ignore_writes = False
+        self.siren_off = False
+        self.panic: int | None = None
+        self.anm_state = "disarmed"  # ANM 24 NET: whole panel only
+
+    @property
+    def anm(self) -> bool:
+        return self.model in (0x02, 0x24, 0x25)
+
+    def info_payload(self) -> bytes:
+        if self.anm:
+            return bytes([self.model, 6, 1, 0, 0x00, 0, 2])
+        return bytes([self.model, 3, 2, 5, 0x10, 0, 2])
+
+    def basic_payload(self) -> bytes:
+        p = bytearray(49)
+        p[0] = {"disarmed": 0x00, "armed": 0x60, "stay": 0xE0}[self.anm_state]
+        for zone in self.bypassed:
+            p[33 + (zone - 1) // 8] |= 1 << ((zone - 1) % 8)
+        p[43:49] = bytes([0x24, 0x11, 0x26, 0x13, 0x05, 0x00])
+        return bytes(p)
+
+    def _general(self) -> int:
+        armed = [a or s for a, s in self.partitions.values()]
+        stay = any(s for _, s in self.partitions.values())
+        if all(armed):
+            byte = 0x60
+        elif any(armed):
+            byte = 0x20
+        else:
+            byte = 0x00
+        return byte | (0x80 if stay and any(armed) else 0)
+
+    def status_payload(self) -> bytes:
+        p = bytearray(143)
+        p[0], p[1:4], p[4] = self.model, bytes([3, 2, 5]), 0x10
+        p[20] = self._general()
+        for pid, (armed, stay) in self.partitions.items():
+            p[21 + pid] = 0x80 | (0x01 if armed else 0) | (0x02 if stay else 0)
+        for zone in self.bypassed:
+            p[54 + (zone - 1) // 8] |= 1 << ((zone - 1) % 8)
+        p[64:70] = bytes([0x24, 0x11, 0x26, 0x13, 0x05, 0x00])
+        p[134] = 4
+        for pgm in self.pgm:
+            p[137 + (pgm - 1) // 8] |= 1 << ((pgm - 1) % 8)
+        return bytes(p)
+
+    def handle(self, cmd: int, payload: bytes):
+        from intelbras_amt import protocol_v2 as p2
+
+        def reply(command, data=b""):
+            return p2.build_frame(command, data, source=b"\x00\x00")
+
+        if cmd == p2.Cmd.AUTH:
+            digits = "".join(str(d) for d in payload[1:7])[: len(self.password)]
+            return reply(p2.Cmd.AUTH, bytes([0 if digits == self.password else 1, self.model]))
+        if cmd == p2.Cmd.INFO:
+            return reply(p2.Cmd.INFO, self.info_payload())
+        if cmd == p2.Cmd.STATUS and not self.anm:
+            return reply(p2.Cmd.STATUS, self.status_payload())
+        if cmd == p2.Cmd.STATUS_BASIC:
+            return reply(p2.Cmd.STATUS_BASIC, self.basic_payload())
+        if cmd == p2.Cmd.ARM_DISARM and self.anm:
+            if payload[0] != 0xFF:
+                return reply(p2.Cmd.NACK, bytes([26]))
+            if not self.ignore_writes:
+                self.anm_state = {0: "disarmed", 1: "armed", 2: "stay"}[payload[1]]
+            return reply(p2.Cmd.ACK)
+        if cmd == p2.Cmd.ARM_DISARM:
+            target, op = payload[0], payload[1]
+            if op in (1, 2) and self.open_zones:
+                return reply(p2.Cmd.NACK, bytes([39]))
+            ids = list(self.partitions) if target == 0xFF else [target]
+            if any(i not in self.partitions for i in ids):
+                return reply(p2.Cmd.NACK, bytes([26]))
+            if not self.ignore_writes:
+                for i in ids:
+                    self.partitions[i] = [op == 1, op == 2]
+            return reply(p2.Cmd.ACK)
+        if cmd == p2.Cmd.BYPASS:
+            if not self.ignore_writes:
+                for i in range(0, len(payload), 2):
+                    zone = payload[i] + 1
+                    (self.bypassed.add if payload[i + 1] else self.bypassed.discard)(zone)
+            return reply(p2.Cmd.ACK)
+        if cmd == p2.Cmd.PGM_ON_OFF:
+            if not self.ignore_writes:
+                (self.pgm.add if payload[1] else self.pgm.discard)(payload[0] + 1)
+            return reply(p2.Cmd.ACK)
+        if cmd == p2.Cmd.TURN_OFF_SIREN:
+            self.siren_off = True
+            return reply(p2.Cmd.ACK)
+        if cmd == p2.Cmd.PANIC:
+            self.panic = payload[0]
+            return reply(p2.Cmd.ACK)
+        if cmd == p2.Cmd.DISCONNECT:
+            return reply(p2.Cmd.ACK)
+        return reply(p2.Cmd.NACK, bytes([0xFE]))

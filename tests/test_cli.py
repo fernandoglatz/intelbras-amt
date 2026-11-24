@@ -75,3 +75,24 @@ def test_settings_errors(tmp_path):
         load_settings(env_file=missing, environ={})
     with pytest.raises(ConfigError, match="AMT_PORT"):
         load_settings(env_file=missing, environ={"AMT_HOST": "h", "AMT_PASSWORD": "123456", "AMT_PORT": "x"})
+
+
+def test_quick_status_text_does_not_report_unread_fields(fake_panel, capsys):
+    # Regression: --quick skips the problems/bypass reads, so it must not print "none".
+    assert cli.main(args_for(fake_panel, "status", "--quick")) == 0
+    out = capsys.readouterr().out
+    assert "Problems:   not read (--quick)" in out
+    assert "Bypassed:   not read (--quick)" in out
+    assert "Problems:   none" not in out
+
+
+def test_quick_status_json_marks_unread_fields_null(fake_panel, capsys):
+    assert cli.main(args_for(fake_panel, "--format", "json", "status", "--quick")) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["problems"] is None and out["bypassed_zones"] is None
+
+
+def test_status_text_shows_partial_arming(panel_state, fake_panel, capsys):
+    panel_state.armed_mask = 0x01
+    assert cli.main(args_for(fake_panel, "status", "--quick")) == 0
+    assert "Armed:      partial (mask 0x01)" in capsys.readouterr().out

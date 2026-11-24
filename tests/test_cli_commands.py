@@ -181,10 +181,15 @@ def test_e9_read_and_error_exit_codes(capsys):
     replies = iter([bytes.fromhex("02 e9 fe ea"), bytes.fromhex("02 e9 e1 f5")])
     panel = FakePanel(lambda raw: next(replies), raw=True)
     try:
-        argv = ["--host", "127.0.0.1", "--port", str(panel.port), "--password", "1234"]
+        argv = ["--host", "127.0.0.1", "--port", str(panel.port), "--password", "1234", "--protocol", "v1"]
         assert cli.main(argv + ["e9", "5a"]) == 0
         assert cli.main(argv + ["e9", "5a"]) == 1
     finally:
         panel.close()
     out = capsys.readouterr().out
     assert "ACK" in out and "wrong password" in out
+
+
+def test_e9_needs_explicit_v1(capsys):
+    assert cli.main(BASE + ["e9", "5a"]) == 1
+    assert "--protocol v1" in capsys.readouterr().err

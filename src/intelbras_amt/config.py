@@ -31,6 +31,7 @@ class Settings:
     host: str | None
     port: int
     password: str | None
+    protocol: str = "auto"
 
 
 def load_settings(
@@ -41,6 +42,7 @@ def load_settings(
     environ: dict[str, str] | None = None,
     require_host: bool = True,
     require_password: bool = True,
+    protocol: str | None = None,
 ) -> Settings:
     """Flags win over environment variables, which win over the ``.env`` file."""
     env = dict(read_env_file(env_file or Path.cwd() / ".env"))
@@ -56,4 +58,7 @@ def load_settings(
             port = int(env.get("AMT_PORT", DEFAULT_PORT))
         except ValueError as exc:
             raise ConfigError("AMT_PORT must be a number") from exc
-    return Settings(host=host, port=port, password=password)
+    protocol = (protocol or env.get("AMT_PROTOCOL") or "auto").lower()
+    if protocol not in ("auto", "v1", "v2"):
+        raise ConfigError("AMT_PROTOCOL / --protocol must be auto, v1 or v2")
+    return Settings(host=host, port=port, password=password, protocol=protocol)

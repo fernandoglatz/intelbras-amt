@@ -127,11 +127,11 @@ class Status:
     unknown_flags: int
     zone_count: int = 48
     stay_armed: bool | None = None
-    bypassed_zones: list[int] = field(default_factory=list)
+    bypassed_zones: list[int] | None = None  # None: not read (quick status, 2018/4010 layouts)
     partitioned: bool | None = None
     alarm_firing: bool | None = None
     pgm: dict[str, bool] = field(default_factory=dict)
-    problems: list[str] = field(default_factory=list)
+    problems: list[str] | None = None  # None: not read (quick status)
     # Smart models only (from the 0x27 reply).
     enabled_zones: list[int] | None = None
     stay_zones: list[int] | None = None

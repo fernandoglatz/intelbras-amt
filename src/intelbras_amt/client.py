@@ -61,6 +61,56 @@ class CommandError(AmtError):
     pass
 
 
+class WrongFamilyError(AmtError):
+    """The panel speaks the other ISECNet family (v1 E7 vs v2 AMT 8000)."""
+
+
+REFRESH_ANSWER_V1 = Answer.REFRESH  # 0x90
+REFRESH_ANSWER_V2 = 0x80  # AMT 8000 family (Converters.TranslateAmt8000)
+NOT_ISECNET = "not an AMT 2018-family or AMT 8000 panel"
+
+
+def connect_socket(host: str, port: int, timeout: float, connect_timeout: float, attempts: int, retry_delay: float):
+    last: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            sock = socket.create_connection((host, port), timeout=connect_timeout)
+            sock.settimeout(timeout)
+            return sock
+        except OSError as exc:  # the panel needs a while to free a previous session
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(retry_delay)
+    raise AmtError(f"cannot connect to {host}:{port}: {last}")
+
+
+def probe_family(sock: socket.socket) -> str:
+    """Send the v1 refresh and tell the family from the answer: "v1" (0x90) or "v2" (0x80).
+
+    AMT Remoto sends exactly this refresh first on every local login, to both
+    families; it is the only command sent before the family is known.
+    """
+    try:
+        sock.sendall(build_frame(bytes([Cmd.REFRESH])))
+        raw = _read_frame(sock)
+    except socket.timeout as exc:
+        raise PanelTimeout("no answer to refresh") from exc
+    except OSError as exc:
+        raise AmtError(f"connection lost during refresh: {exc}") from exc
+    try:
+        answer = parse_frame(raw).command
+    except FrameError as exc:
+        if len(raw) >= 4 and raw[1] == 0xE7:
+            answer = raw[3]
+        else:
+            raise AmtError(f"unrecognised answer to refresh ({exc}); {NOT_ISECNET}") from exc
+    if answer == REFRESH_ANSWER_V1:
+        return "v1"
+    if answer == REFRESH_ANSWER_V2:
+        return "v2"
+    raise AmtError(f"panel answered refresh with 0x{answer:02X}; {NOT_ISECNET}")
+
+
 class AmtClient:
     """One authenticated session. The panel serves few sessions at a time, so
     always close it (or use it as a context manager) to send HANG_UP."""
@@ -89,7 +139,8 @@ class AmtClient:
     # -- session ---------------------------------------------------------
 
     def __enter__(self) -> "AmtClient":
-        self.open()
+        if self._sock is None:  # open_panel() hands over an already logged-in client
+            self.open()
         return self
 
     def __exit__(self, *exc) -> None:
@@ -97,21 +148,26 @@ class AmtClient:
 
     def open(self) -> None:
         # Validate before touching the network.
-        identify = identify_data(self.password)
-        self._connect()
+        identify_data(self.password)
+        sock = connect_socket(
+            self.host, self.port, self.timeout, self.connect_timeout, self.connect_attempts, self.retry_delay
+        )
         try:
-            try:
-                reply = self.request(bytes([Cmd.REFRESH]))
-            except FrameError as exc:
-                raise AmtError(
-                    f"unrecognised answer to refresh ({exc}); "
-                    "not an AMT 2018-family panel (AMT 8000/9000 use another protocol)"
-                ) from exc
-            if reply.command != Answer.REFRESH:
-                raise AmtError(
-                    f"panel answered refresh with 0x{reply.command:02X}; "
-                    "not an AMT 2018-family panel (AMT 8000/9000 use another protocol)"
+            family = probe_family(sock)
+            if family != "v1":
+                raise WrongFamilyError(
+                    "this panel speaks ISECNet v2 (AMT 8000 family); use the v2 client / --protocol v2"
                 )
+        except BaseException:
+            sock.close()
+            raise
+        self.attach(sock)
+
+    def attach(self, sock: socket.socket) -> None:
+        """Log in on a socket whose refresh already identified a v1 panel."""
+        self._sock = sock  # owned from here on, so any failure below closes it
+        try:
+            identify = identify_data(self.password)
             reply = self.request(identify)
             if reply.command not in IDENTIFY_OK:
                 raise AuthError(f"password rejected (answer 0x{reply.command:02X})")
@@ -119,19 +175,6 @@ class AmtClient:
         except BaseException:
             self._drop()
             raise
-
-    def _connect(self) -> None:
-        last: OSError | None = None
-        for attempt in range(self.connect_attempts):
-            try:
-                self._sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
-                self._sock.settimeout(self.timeout)
-                return
-            except OSError as exc:  # the panel needs a while to free a previous session
-                last = exc
-                if attempt + 1 < self.connect_attempts:
-                    time.sleep(self.retry_delay)
-        raise AmtError(f"cannot connect to {self.host}:{self.port}: {last}")
 
     def close(self) -> None:
         if self._sock is None:
@@ -228,19 +271,34 @@ class AmtClient:
     def mac(self) -> str:
         return decode.decode_mac(self.request(read_eeprom_data(MAC_ADDRESS, 6)))
 
+    def _require(self, layouts: set[str], what: str) -> None:
+        """Refuse a model-specific command before sending it to a model that lacks it.
+
+        An AMT 1016 NET sent the Smart-only CONNECTIONS (0x30) stopped
+        answering on the network, so these are never sent blindly.
+        """
+        info = self.model()
+        if info.layout not in layouts:
+            raise CommandError(f"{what} is not supported by {info.name}; not sent")
+
     def bus_devices(self) -> dict[str, list[int]]:
+        self._require({"4010", "smart"}, "bus devices")
         return decode.decode_bus_devices(self._query(bytes([Cmd.BUS_DEVICES]), Answer.BUS_DEVICES, "bus devices"))
 
     def connections(self) -> dict:
+        self._require({"smart"}, "connection status")
         return decode.decode_connections(self._query(bytes([Cmd.CONNECTIONS]), Answer.CONNECTIONS, "connection status"))
 
     def network_card(self) -> dict[str, str]:
+        self._require({"smart"}, "network card info")
         return decode.decode_network_card(self._query(bytes([Cmd.NETWORK_CARD]), Answer.NETWORK_CARD, "network card info"))
 
     def cell_card(self) -> dict:
+        self._require({"smart"}, "cellular card info")
         return decode.decode_cell_card(self._query(bytes([Cmd.CELL_CARD]), Answer.CELL_CARD, "cellular card info"))
 
     def wireless_sensors(self) -> list[dict]:
+        self._require({"smart"}, "wireless sensor status")
         frame = self._query(bytes([Cmd.WIRELESS_SENSORS]), Answer.WIRELESS_SENSORS, "wireless sensor status")
         return decode.decode_wireless_sensors(frame)
 
@@ -256,7 +314,16 @@ class AmtClient:
         before = self._status_only()
         current = self._armed_state(before, partition, stay)
         if current is _PARTIAL:
-            raise CommandError("only some partitions are armed; arm/disarm partitions individually")
+            if stay:
+                raise CommandError("only some partitions are stay-armed; arm/disarm partitions individually")
+            # The whole-panel toggle is ambiguous here: toggle each partition that differs.
+            for index, part in enumerate(before.partitions, start=1):
+                if part.armed != armed:
+                    decode.check_arm_answer(self.request(bytes([Cmd.REMOTE_ARM, arm_mask(index, False)])))
+            after = self._status_only()
+            if self._armed_state(after, None, False) != armed:
+                raise CommandError(f"panel state did not change (armed mask 0x{after.armed_mask:02X})")
+            return after
         if current == armed:
             return before
         decode.check_arm_answer(self.request(bytes([Cmd.REMOTE_ARM, arm_mask(partition, stay)])))
@@ -348,6 +415,7 @@ class AmtClient:
 
     def search_bus(self) -> bool:
         """Ask the panel to scan its keypad/receiver bus (AMT 4010 Smart)."""
+        self._require({"4010"}, "bus search")
         frame = self._query(bytes([Cmd.SEARCH_BUS_DEVICES]), Answer.SEARCH_BUS_DEVICES, "bus search")
         return decode.decode_search_bus(frame)
 
