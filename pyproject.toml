@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intelbras-amt"
+version = "0.2.0"
+description = "Local, cloud-free client for Intelbras AMT ISECNet v1 alarm panels (AMT 1016 NET, AMT 2018 family, Smart, 4010)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["intelbras", "alarm", "amt", "isecnet", "home-automation"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/fernandoglatz/intelbras-amt"
+Issues = "https://github.com/fernandoglatz/intelbras-amt/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+intelbras-amt = "intelbras_amt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
